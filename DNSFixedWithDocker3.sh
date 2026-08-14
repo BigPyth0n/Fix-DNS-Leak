@@ -163,16 +163,16 @@ install_dependencies() {
     apt-get update -qq
 
     apt-get install -y -qq \
-        ca-certificates \
-        curl \
-        dnsutils \
-        iproute2 \
-        iptables \
-        iptables-persistent \
-        systemd-resolved \
-        gpg \
-        lsb-release \
-        openssl
+    ca-certificates \
+    curl \
+    dnsutils \
+    iproute2 \
+    iptables \
+    iptables-persistent \
+    systemd \
+    gpg \
+    lsb-release \
+    openssl
 
     log_success "Required packages installed."
 }
