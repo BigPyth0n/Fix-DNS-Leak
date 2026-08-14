@@ -46,8 +46,6 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/BigPyth0n/Fix-DNS-L
 
 
 
----
-
 ## هشدار امنیتی
 
 این اسکریپت تغییرات مهم و سطح پایینی در سیستم‌عامل ایجاد می‌کند و باید با احتیاط اجرا شود.
