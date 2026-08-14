@@ -38,7 +38,7 @@
 
 ### 🚀 اجرای مستقیم با curl:
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/BigPyth0n/Fix-DNS-Leak-With-DockerOnly/refs/heads/main/DNSFixedWithDocker.sh)"
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/BigPyth0n/Fix-DNS-Leak-With-DockerOnly/refs/heads/main/FixDNSLeak.sh)"
 ```
 
 ---
