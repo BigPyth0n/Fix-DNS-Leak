@@ -31,6 +31,21 @@
 - [سلب مسئولیت](#سلب-مسئولیت)
 - [چک‌لیست انتشار](#چکلیست-انتشار)
 
+
+---
+
+## 🚀 دانلود و اجرای مستقیم از GitHub
+
+### 🚀 اجرای مستقیم با curl:
+```bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/BigPyth0n/Fix-DNS-Leak-With-DockerOnly/refs/heads/main/DNSFixedWithDocker.sh)"
+```
+
+---
+
+
+
+
 ---
 
 ## هشدار امنیتی
