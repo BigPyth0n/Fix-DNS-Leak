@@ -1,4 +1,3 @@
-```bash
 #!/bin/bash
 set -euo pipefail
 
@@ -327,4 +326,3 @@ if [ "$LEAK_DETECTED" = false ]; then
 else
     exit 1
 fi
-```
