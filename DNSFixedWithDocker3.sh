@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ==============================================================================
-# Ubuntu 22.04 DNS Leak Protection
+# Ubuntu 22.04 DNS-over-HTTPS Leak Protection
 #
 # Architecture:
 #
@@ -11,7 +11,7 @@
 #   127.0.0.1:53
 #       |
 #       v
-#   dnscrypt-proxy
+#   dnscrypt-proxy 2.0.45+
 #       |
 #       v
 #   DNS-over-HTTPS
@@ -19,18 +19,22 @@
 #       v
 #   Cloudflare DNS
 #
-# This script:
-#   - Removes the old cloudflared proxy-dns configuration.
-#   - Installs and configures dnscrypt-proxy.
-#   - Uses Cloudflare over DNS-over-HTTPS.
+# Features:
+#   - Uses dnscrypt-proxy instead of deprecated cloudflared proxy-dns.
+#   - Removes old cloudflared-dns.service.
+#   - Disables and masks dnscrypt-proxy.socket to prevent port conflicts.
 #   - Listens only on 127.0.0.1:53.
-#   - Blocks direct outbound DNS and DNS-over-TLS.
-#   - Saves IPv4 and IPv6 firewall rules persistently.
+#   - Uses Cloudflare DNS-over-HTTPS.
+#   - Blocks direct outbound DNS on ports 53 and 853.
+#   - Configures IPv4 and IPv6 firewall rules.
+#   - Saves firewall rules persistently.
+#   - Creates backups before changing files.
+#   - Shows a final summary table.
 #
 # Important:
-#   - Applications with their own DoH, VPN or proxy can bypass this setup.
-#   - Cloudflare Anycast cannot guarantee the country shown by DNS leak tests.
-#   - The script modifies /etc/resolv.conf and firewall OUTPUT rules.
+#   - Applications with their own DoH, DoT, VPN or proxy can bypass this setup.
+#   - Cloudflare Anycast cannot guarantee the country shown in DNS leak tests.
+#   - This script modifies /etc/resolv.conf and firewall OUTPUT rules.
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -50,11 +54,12 @@ readonly LOG_FILE="${LOG_DIR}/dns-fix-$(date +%Y%m%d_%H%M%S).log"
 readonly DNS_ADDRESS="127.0.0.1"
 readonly DNS_PORT="53"
 
-readonly DNSCRYPT_PACKAGE="dnscrypt-proxy"
 readonly DNSCRYPT_SERVICE="dnscrypt-proxy.service"
+readonly DNSCRYPT_SOCKET="dnscrypt-proxy.socket"
 readonly DNSCRYPT_CONFIG_DIR="/etc/dnscrypt-proxy"
 readonly DNSCRYPT_CONFIG="${DNSCRYPT_CONFIG_DIR}/dnscrypt-proxy.toml"
 readonly DNSCRYPT_CACHE_DIR="/var/cache/dnscrypt-proxy"
+readonly DNSCRYPT_STATE_DIR="/var/lib/dnscrypt-proxy"
 readonly DNSCRYPT_SERVICE_FILE="/etc/systemd/system/dnscrypt-proxy.service"
 readonly DNSCRYPT_BINARY="/usr/sbin/dnscrypt-proxy"
 
@@ -78,6 +83,20 @@ readonly C_YELLOW='\033[1;33m'
 readonly C_CYAN='\033[0;36m'
 readonly C_BOLD='\033[1m'
 readonly C_RESET='\033[0m'
+
+# ------------------------------------------------------------------------------
+# Report Variables
+# ------------------------------------------------------------------------------
+
+REPORT_SERVICE="FAILED"
+REPORT_LISTENER="FAILED"
+REPORT_RESOLV="FAILED"
+REPORT_UDP="FAILED"
+REPORT_TCP="FAILED"
+REPORT_IPV4_FIREWALL="FAILED"
+REPORT_IPV6_FIREWALL="SKIPPED"
+REPORT_PERSISTENCE="FAILED"
+REPORT_DNSCRYPT_VERSION="UNKNOWN"
 
 # ------------------------------------------------------------------------------
 # Logging
@@ -185,23 +204,31 @@ validate_commands() {
     local required_command
 
     for required_command in \
-        apt-get \
         awk \
         curl \
         dig \
         grep \
+        id \
+        install \
         iptables \
         iptables-save \
-        install \
-        mktemp \
         sed \
         ss \
-        systemctl; do
+        systemctl \
+        useradd; do
 
         command -v "${required_command}" >/dev/null 2>&1 || {
             die "Required command not found: ${required_command}"
         }
     done
+
+    [[ -x "${DNSCRYPT_BINARY}" ]] || {
+        DNSCRYPT_BINARY="$(command -v dnscrypt-proxy || true)"
+
+        [[ -n "${DNSCRYPT_BINARY}" ]] || {
+            die "dnscrypt-proxy binary was not found."
+        }
+    }
 }
 
 # ------------------------------------------------------------------------------
@@ -230,16 +257,7 @@ EOF
         iproute2 \
         iptables \
         iptables-persistent \
-        openssl \
         systemd
-
-    [[ -x "${DNSCRYPT_BINARY}" ]] || {
-        if command -v dnscrypt-proxy >/dev/null 2>&1; then
-            log_info "dnscrypt-proxy binary found through PATH."
-        else
-            die "dnscrypt-proxy binary was not installed."
-        fi
-    }
 
     log_success "Required packages installed."
 }
@@ -253,7 +271,9 @@ backup_file() {
 
     if [[ -e "${source_file}" || -L "${source_file}" ]]; then
         local safe_name
-        safe_name="$(echo "${source_file}" | sed 's#^/##; s#/#_#g')"
+
+        safe_name="$(echo "${source_file}" |
+            sed 's#^/##; s#/#_#g')"
 
         cp -a \
             --no-preserve=ownership \
@@ -285,29 +305,21 @@ backup_configuration() {
 }
 
 # ------------------------------------------------------------------------------
-# Remove Old cloudflared Configuration
+# Remove Old Services
 # ------------------------------------------------------------------------------
 
 remove_old_cloudflared() {
-    log_info "Removing old cloudflared DNS proxy configuration..."
+    log_info "Removing old cloudflared DNS service..."
 
-    if systemctl list-unit-files 2>/dev/null |
-        awk '{print $1}' |
-        grep -qx "cloudflared-dns.service"; then
-
-        systemctl disable --now cloudflared-dns.service >/dev/null 2>&1 || true
-    fi
+    systemctl disable --now cloudflared-dns.service \
+        >/dev/null 2>&1 || true
 
     rm -f "${CLOUDFLARED_SERVICE_FILE}"
 
     systemctl daemon-reload
 
-    log_success "Old cloudflared DNS configuration removed."
+    log_success "Old cloudflared service removed."
 }
-
-# ------------------------------------------------------------------------------
-# systemd-resolved
-# ------------------------------------------------------------------------------
 
 disable_systemd_resolved() {
     if systemctl list-unit-files \
@@ -317,44 +329,68 @@ disable_systemd_resolved() {
         awk '{print $1}' |
         grep -qx "systemd-resolved.service"; then
 
-        log_info "Stopping systemd-resolved..."
+        log_info "Disabling systemd-resolved..."
 
         systemctl disable --now systemd-resolved.service \
             >/dev/null 2>&1 || true
     fi
 }
 
+disable_dnscrypt_socket() {
+    log_info "Disabling dnscrypt-proxy socket activation..."
+
+    # Stop the package-provided socket because it may listen on 127.0.2.1:53.
+    systemctl disable --now "${DNSCRYPT_SOCKET}" \
+        >/dev/null 2>&1 || true
+
+    # Mask it so that it cannot be started automatically again.
+    systemctl mask "${DNSCRYPT_SOCKET}" \
+        >/dev/null 2>&1 || true
+
+    # Stop any package-provided service instance before using our own unit.
+    systemctl stop "${DNSCRYPT_SERVICE}" \
+        >/dev/null 2>&1 || true
+
+    systemctl daemon-reload
+
+    log_success "dnscrypt-proxy.socket disabled and masked."
+}
+
 # ------------------------------------------------------------------------------
-# dnscrypt-proxy User
+# dnscrypt-proxy User and Directories
 # ------------------------------------------------------------------------------
 
 create_dnscrypt_user() {
-    local service_user="dnscrypt"
-
-    if ! id "${service_user}" >/dev/null 2>&1; then
+    if ! id dnscrypt >/dev/null 2>&1; then
         useradd \
             --system \
-            --home-dir /var/lib/dnscrypt-proxy \
+            --home-dir "${DNSCRYPT_STATE_DIR}" \
             --create-home \
             --shell /usr/sbin/nologin \
-            "${service_user}"
+            dnscrypt
 
-        log_info "Created system user: ${service_user}"
+        log_info "Created system user: dnscrypt"
     else
-        log_info "System user already exists: ${service_user}"
+        log_info "System user dnscrypt already exists."
     fi
 
     install -d \
-        -o "${service_user}" \
-        -g "${service_user}" \
+        -o dnscrypt \
+        -g dnscrypt \
         -m 0750 \
-        /var/lib/dnscrypt-proxy
+        "${DNSCRYPT_STATE_DIR}"
 
     install -d \
-        -o "${service_user}" \
-        -g "${service_user}" \
+        -o dnscrypt \
+        -g dnscrypt \
         -m 0750 \
         "${DNSCRYPT_CACHE_DIR}"
+
+    install -d \
+        -o root \
+        -g root \
+        -m 0755 \
+        "${DNSCRYPT_CONFIG_DIR}"
 }
 
 # ------------------------------------------------------------------------------
@@ -363,8 +399,6 @@ create_dnscrypt_user() {
 
 configure_dnscrypt_proxy() {
     log_info "Creating dnscrypt-proxy configuration..."
-
-    mkdir -p "${DNSCRYPT_CONFIG_DIR}"
 
     if [[ -f "${DNSCRYPT_CONFIG}" ]]; then
         cp -a \
@@ -375,51 +409,54 @@ configure_dnscrypt_proxy() {
     cat > "${DNSCRYPT_CONFIG}" <<'EOF'
 # ============================================================================
 # dnscrypt-proxy configuration
+# Compatible with dnscrypt-proxy 2.0.45
 # Managed by dns-fix
 # ============================================================================
 
-# Listen only on the local machine.
+# Listen only locally.
 listen_addresses = ['127.0.0.1:53']
 
-# Use Cloudflare resolver only.
+# Use Cloudflare only.
 server_names = ['cloudflare']
 
-# Enable DNS-over-HTTPS resolvers.
+# Enable DNS-over-HTTPS.
 doh_servers = true
 
-# Disable the DNSCrypt protocol.
+# Disable DNSCrypt protocol.
 dnscrypt_servers = false
 
-# Do not use IPv6 upstream resolvers.
+# Do not use IPv6 upstream servers.
 ipv4_servers = true
 ipv6_servers = false
 
-# DNSSEC and resolver requirements.
+# DNSSEC settings.
+# NOTE:
+# require_min_protocol is intentionally omitted because dnscrypt-proxy 2.0.45
+# does not support that configuration key.
 require_dnssec = true
 require_nofilter = false
-require_min_protocol = '2.0'
 
-# Local cache.
+# Local DNS cache.
 cache = true
 cache_size = 512
 cache_min_ttl = 60
 cache_max_ttl = 86400
 
-# Do not use plain DNS as a fallback.
+# Never use plain DNS as a fallback.
 fallback_resolvers = []
 
-# Bootstrap resolvers are used only for resolver discovery.
-# Normal DNS traffic is still blocked by the firewall.
+# Bootstrap resolvers are used for resolver discovery.
+# Direct outbound port 53 is blocked after startup.
 bootstrap_resolvers = ['1.1.1.1:53', '1.0.0.1:53']
 
-# Timeouts.
+# Network timeouts.
 timeout = 5000
 keepalive = 30
 
-# Do not listen on IPv6.
+# Ignore the system resolver.
 ignore_system_dns = true
 
-# Resolver list source.
+# Resolver list sources.
 [sources]
 
 [sources.public-resolvers]
@@ -442,17 +479,18 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# dnscrypt-proxy Systemd Service
+# dnscrypt-proxy systemd Service
 # ------------------------------------------------------------------------------
 
 create_dnscrypt_service() {
-    log_info "Creating dnscrypt-proxy systemd service..."
+    log_info "Creating custom dnscrypt-proxy service..."
 
     cat > "${DNSCRYPT_SERVICE_FILE}" <<EOF
 [Unit]
 Description=DNS-over-HTTPS Local Resolver via dnscrypt-proxy
 Wants=network-online.target
 After=network-online.target
+Conflicts=${DNSCRYPT_SOCKET}
 
 [Service]
 Type=simple
@@ -465,7 +503,7 @@ Restart=on-failure
 RestartSec=5
 TimeoutStartSec=60
 
-# Required to bind to port 53 as a non-root user.
+# Allow non-root process to bind to port 53.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
@@ -484,7 +522,7 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 
 ReadOnlyPaths=${DNSCRYPT_CONFIG}
-ReadWritePaths=${DNSCRYPT_CACHE_DIR} /var/lib/dnscrypt-proxy
+ReadWritePaths=${DNSCRYPT_CACHE_DIR} ${DNSCRYPT_STATE_DIR}
 
 [Install]
 WantedBy=multi-user.target
@@ -495,7 +533,7 @@ EOF
     systemctl daemon-reload
     systemctl enable "${DNSCRYPT_SERVICE}"
 
-    log_success "dnscrypt-proxy systemd service created."
+    log_success "Custom dnscrypt-proxy service created."
 }
 
 # ------------------------------------------------------------------------------
@@ -511,14 +549,14 @@ configure_resolv_conf() {
 
     cat > /etc/resolv.conf <<EOF
 # Managed by ${SCRIPT_NAME}
-# Local DNS-over-HTTPS resolver
+# DNS-over-HTTPS local resolver
 nameserver ${DNS_ADDRESS}
 options timeout:2 attempts:3
 EOF
 
     chmod 0644 /etc/resolv.conf
 
-    log_success "/etc/resolv.conf configured to use ${DNS_ADDRESS}."
+    log_success "/etc/resolv.conf now uses ${DNS_ADDRESS}."
 }
 
 # ------------------------------------------------------------------------------
@@ -548,7 +586,7 @@ remove_output_jump() {
 # ------------------------------------------------------------------------------
 
 configure_ipv4_firewall() {
-    log_info "Configuring IPv4 DNS firewall rules..."
+    log_info "Configuring IPv4 firewall rules..."
 
     remove_output_jump iptables "${IPTABLES_CHAIN}"
 
@@ -558,7 +596,7 @@ configure_ipv4_firewall() {
 
     iptables -F "${IPTABLES_CHAIN}"
 
-    # Allow local loopback traffic.
+    # Allow loopback traffic.
     iptables -A "${IPTABLES_CHAIN}" -o lo -j RETURN
 
     # Block direct DNS and DNS-over-TLS.
@@ -567,10 +605,10 @@ configure_ipv4_firewall() {
     iptables -A "${IPTABLES_CHAIN}" -p udp --dport 853 -j DROP
     iptables -A "${IPTABLES_CHAIN}" -p tcp --dport 853 -j DROP
 
-    # Put the protection chain at the top of OUTPUT.
+    # Put the chain at the top of OUTPUT.
     iptables -I OUTPUT 1 -j "${IPTABLES_CHAIN}"
 
-    log_success "IPv4 direct DNS traffic blocked."
+    log_success "IPv4 DNS and DoT traffic blocked."
 }
 
 # ------------------------------------------------------------------------------
@@ -579,16 +617,18 @@ configure_ipv4_firewall() {
 
 configure_ipv6_firewall() {
     if ! command -v ip6tables >/dev/null 2>&1; then
-        log_warn "ip6tables is not installed; skipping IPv6 rules."
+        log_warn "ip6tables is not installed; IPv6 rules skipped."
+        REPORT_IPV6_FIREWALL="SKIPPED"
         return 0
     fi
 
     if [[ ! -e /proc/net/if_inet6 ]]; then
-        log_warn "IPv6 is disabled; skipping IPv6 rules."
+        log_warn "IPv6 is disabled; IPv6 rules skipped."
+        REPORT_IPV6_FIREWALL="SKIPPED"
         return 0
     fi
 
-    log_info "Configuring IPv6 DNS firewall rules..."
+    log_info "Configuring IPv6 firewall rules..."
 
     remove_output_jump ip6tables "${IP6TABLES_CHAIN}"
 
@@ -598,7 +638,7 @@ configure_ipv6_firewall() {
 
     ip6tables -F "${IP6TABLES_CHAIN}"
 
-    # Allow local loopback traffic.
+    # Allow loopback traffic.
     ip6tables -A "${IP6TABLES_CHAIN}" -o lo -j RETURN
 
     # Block direct DNS and DNS-over-TLS.
@@ -609,7 +649,9 @@ configure_ipv6_firewall() {
 
     ip6tables -I OUTPUT 1 -j "${IP6TABLES_CHAIN}"
 
-    log_success "IPv6 direct DNS traffic blocked."
+    REPORT_IPV6_FIREWALL="PASS"
+
+    log_success "IPv6 DNS and DoT traffic blocked."
 }
 
 save_firewall_rules() {
@@ -622,7 +664,7 @@ save_firewall_rules() {
     if command -v ip6tables-save >/dev/null 2>&1 &&
         [[ -e /proc/net/if_inet6 ]]; then
 
-        ip6tables-save > /etc/iptables/rules.v6 || true
+        ip6tables-save > /etc/iptables/rules.v6
     fi
 
     if command -v netfilter-persistent >/dev/null 2>&1; then
@@ -633,7 +675,9 @@ save_firewall_rules() {
             >/dev/null 2>&1 || true
     fi
 
-    log_success "Firewall rules saved."
+    REPORT_PERSISTENCE="PASS"
+
+    log_success "Firewall rules saved persistently."
 }
 
 configure_firewall() {
@@ -647,9 +691,11 @@ configure_firewall() {
 # ------------------------------------------------------------------------------
 
 start_dnscrypt_service() {
-    log_info "Starting dnscrypt-proxy..."
+    log_info "Starting dnscrypt-proxy service..."
 
-    systemctl reset-failed "${DNSCRYPT_SERVICE}" >/dev/null 2>&1 || true
+    systemctl reset-failed "${DNSCRYPT_SERVICE}" \
+        >/dev/null 2>&1 || true
+
     systemctl restart "${DNSCRYPT_SERVICE}"
 
     sleep 2
@@ -660,6 +706,8 @@ start_dnscrypt_service() {
 
         die "dnscrypt-proxy service failed to start."
     fi
+
+    REPORT_SERVICE="PASS"
 
     log_success "dnscrypt-proxy service is active."
 }
@@ -678,7 +726,9 @@ wait_for_local_dns() {
             awk '$4 == "127.0.0.1:53" {found=1}
                  END {exit !found}'; then
 
-            log_success "DNS listener is active on ${DNS_ADDRESS}:${DNS_PORT}."
+            REPORT_LISTENER="PASS"
+
+            log_success "DNS listener is active on 127.0.0.1:53."
             return 0
         fi
 
@@ -694,27 +744,18 @@ wait_for_local_dns() {
     die "Local DNS listener did not start."
 }
 
-test_service() {
-    log_info "Testing dnscrypt-proxy service..."
-
-    systemctl is-active --quiet "${DNSCRYPT_SERVICE}" || {
-        systemctl status "${DNSCRYPT_SERVICE}" --no-pager || true
-        die "dnscrypt-proxy.service is not active."
-    }
-
-    log_success "dnscrypt-proxy.service is active."
-}
-
 test_resolv_conf() {
-    log_info "Testing /etc/resolv.conf..."
+    log_info "Checking /etc/resolv.conf..."
 
-    grep -Eq \
+    if ! grep -Eq \
         '^[[:space:]]*nameserver[[:space:]]+127\.0\.0\.1([[:space:]]*)$' \
-        /etc/resolv.conf || {
+        /etc/resolv.conf; then
 
         cat /etc/resolv.conf
-        die "/etc/resolv.conf does not point to 127.0.0.1."
-    }
+        die "/etc/resolv.conf is not configured to use 127.0.0.1."
+    fi
+
+    REPORT_RESOLV="PASS"
 
     log_success "/etc/resolv.conf is correctly configured."
 }
@@ -734,6 +775,8 @@ test_dns_udp() {
         die "DNS over UDP test failed."
     fi
 
+    REPORT_UDP="PASS"
+
     log_success "DNS over UDP test passed."
 }
 
@@ -752,91 +795,109 @@ test_dns_tcp() {
         die "DNS over TCP test failed."
     fi
 
+    REPORT_TCP="PASS"
+
     log_success "DNS over TCP test passed."
 }
 
 test_firewall_rules() {
     log_info "Checking firewall DNS blocking rules..."
 
-    local ipv4_ok=false
-    local ipv6_ok=false
-
-    if iptables -S "${IPTABLES_CHAIN}" 2>/dev/null |
+    if ! iptables -S "${IPTABLES_CHAIN}" 2>/dev/null |
         grep -Eq -- '--dport (53|853).*DROP'; then
 
-        ipv4_ok=true
+        die "IPv4 DNS blocking rules are missing."
     fi
 
-    [[ "${ipv4_ok}" == true ]] || {
-        die "IPv4 DNS blocking rules are missing."
-    }
+    REPORT_IPV4_FIREWALL="PASS"
 
     if command -v ip6tables >/dev/null 2>&1 &&
-        [[ -e /proc/net/if_inet6 ]] &&
-        ip6tables -S "${IP6TABLES_CHAIN}" 2>/dev/null |
-        grep -Eq -- '--dport (53|853).*DROP'; then
+        [[ -e /proc/net/if_inet6 ]]; then
 
-        ipv6_ok=true
-    fi
+        if ! ip6tables -S "${IP6TABLES_CHAIN}" 2>/dev/null |
+            grep -Eq -- '--dport (53|853).*DROP'; then
 
-    if [[ -e /proc/net/if_inet6 ]]; then
-        [[ "${ipv6_ok}" == true ]] || {
             die "IPv6 DNS blocking rules are missing."
-        }
+        fi
+
+        REPORT_IPV6_FIREWALL="PASS"
     fi
 
     log_success "Direct outbound DNS blocking rules are active."
 }
 
 # ------------------------------------------------------------------------------
-# Status
+# Final Report
 # ------------------------------------------------------------------------------
 
-show_status() {
+print_report_row() {
+    local title="$1"
+    local value="$2"
+
+    printf '| %-32s | %-12s |\n' "${title}" "${value}"
+}
+
+show_final_report() {
+    local version="unknown"
+    local dns_result="FAILED"
+    local ipv4_address="N/A"
+    local ipv6_address="N/A"
+
+    version="$("${DNSCRYPT_BINARY}" --version 2>/dev/null |
+        head -n 1 || true)"
+
+    [[ -n "${version}" ]] || version="dnscrypt-proxy"
+
+    REPORT_DNSCRYPT_VERSION="${version}"
+
+    if dig @"${DNS_ADDRESS}" example.com +short \
+        >/tmp/dns-fix-dig-result 2>/dev/null &&
+        [[ -s /tmp/dns-fix-dig-result ]]; then
+
+        dns_result="$(head -n 1 /tmp/dns-fix-dig-result)"
+    fi
+
+    rm -f /tmp/dns-fix-dig-result
+
+    ipv4_address="$(curl -4fsS --max-time 8 \
+        https://api.ipify.org 2>/dev/null || echo "N/A")"
+
+    ipv6_address="$(curl -6fsS --max-time 8 \
+        https://api6.ipify.org 2>/dev/null || echo "N/A")"
+
     echo
     echo "======================================================================"
-    echo "DNS STATUS"
+    echo "FINAL DNS LEAK PROTECTION REPORT"
     echo "======================================================================"
 
-    echo
-    echo "dnscrypt-proxy service:"
-    systemctl is-active "${DNSCRYPT_SERVICE}" || true
+    printf '+----------------------------------+--------------+\n'
+    printf '| %-32s | %-12s |\n' "Item" "Status"
+    printf '+----------------------------------+--------------+\n'
+
+    print_report_row "Operating system" "Ubuntu 22.04"
+    print_report_row "dnscrypt-proxy" "${REPORT_DNSCRYPT_VERSION}"
+    print_report_row "Service status" "${REPORT_SERVICE}"
+    print_report_row "Local listener 127.0.0.1:53" "${REPORT_LISTENER}"
+    print_report_row "/etc/resolv.conf" "${REPORT_RESOLV}"
+    print_report_row "DNS over UDP" "${REPORT_UDP}"
+    print_report_row "DNS over TCP" "${REPORT_TCP}"
+    print_report_row "IPv4 DNS firewall" "${REPORT_IPV4_FIREWALL}"
+    print_report_row "IPv6 DNS firewall" "${REPORT_IPV6_FIREWALL}"
+    print_report_row "Persistent firewall rules" "${REPORT_PERSISTENCE}"
+    print_report_row "DNS query example.com" "${dns_result}"
+    print_report_row "Public IPv4" "${ipv4_address}"
+    print_report_row "Public IPv6" "${ipv6_address}"
+
+    printf '+----------------------------------+--------------+\n'
 
     echo
-    echo "DNS configuration:"
-    cat "${DNSCRYPT_CONFIG}"
+    echo "Configuration file:"
+    echo "${DNSCRYPT_CONFIG}"
 
     echo
-    echo "/etc/resolv.conf:"
-    cat /etc/resolv.conf
-
-    echo
-    echo "DNS listening sockets:"
-    ss -lntu 2>/dev/null |
-        grep -E '127\.0\.0\.1:53([[:space:]]|$)' || true
-
-    echo
-    echo "DNS test result:"
-    dig @"${DNS_ADDRESS}" example.com +short || true
-
-    echo
-    echo "VPS public IPv4:"
-    curl -4fsS --max-time 10 https://api.ipify.org || true
-    echo
-
-    echo
-    echo "VPS public IPv6:"
-    curl -6fsS --max-time 10 https://api6.ipify.org \
-        2>/dev/null || true
-    echo
-
-    echo
-    echo "IPv4 DNS firewall rules:"
-    iptables -S "${IPTABLES_CHAIN}" 2>/dev/null || true
-
-    echo
-    echo "IPv6 DNS firewall rules:"
-    ip6tables -S "${IP6TABLES_CHAIN}" 2>/dev/null || true
+    echo "Firewall files:"
+    echo "/etc/iptables/rules.v4"
+    echo "/etc/iptables/rules.v6"
 
     echo
     echo "Backup directory:"
@@ -847,6 +908,13 @@ show_status() {
     echo "${LOG_FILE}"
 
     echo
+    echo "Notes:"
+    echo "- DNS upstream is Cloudflare over DNS-over-HTTPS."
+    echo "- Direct outbound DNS ports 53 and 853 are blocked."
+    echo "- Applications with their own DoH, VPN or proxy may bypass this setup."
+    echo "- Cloudflare Anycast does not guarantee the VPS country in leak tests."
+
+    echo
     echo "======================================================================"
 }
 
@@ -855,17 +923,19 @@ show_status() {
 # ------------------------------------------------------------------------------
 
 main() {
+    require_root
     init_logging
 
-    require_root
     validate_os
-    validate_commands
 
     install_dependencies
+    validate_commands
+
     backup_configuration
 
     remove_old_cloudflared
     disable_systemd_resolved
+    disable_dnscrypt_socket
 
     create_dnscrypt_user
     configure_dnscrypt_proxy
@@ -873,24 +943,21 @@ main() {
 
     configure_resolv_conf
 
-    # Start the service before applying the firewall.
-    # dnscrypt-proxy uses DoH over TCP/443.
+    # Start dnscrypt-proxy before applying firewall rules.
+    # This allows initial resolver discovery/bootstrap.
     start_dnscrypt_service
     wait_for_local_dns
 
     configure_firewall
 
-    test_service
     test_resolv_conf
     test_dns_udp
     test_dns_tcp
     test_firewall_rules
 
-    show_status
+    show_final_report
 
-    log_success "DNS leak protection configuration completed."
-    log_warn "Cloudflare Anycast cannot guarantee the VPS country in DNS leak tests."
-    log_warn "Applications using their own DoH, DoT, VPN or proxy may bypass this setup."
+    log_success "DNS leak protection configuration completed successfully."
 }
 
 main "$@"
